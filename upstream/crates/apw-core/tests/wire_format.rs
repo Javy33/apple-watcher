@@ -1,0 +1,262 @@
+//! 跨 IPC 边界的线上格式契约。
+//!
+//! 这些用例钉住的是「Rust 序列化出来长什么样」。前端的 TypeScript 类型是照着
+//! 这个形状手写的，一旦有人调整了 serde 标注，这里会立刻变红 —— 而不是等到
+//! 界面上莫名其妙少了一列、或者状态永远显示不出来才发现。
+//!
+//! 尤其是 `Availability`：它是内部标签枚举套内部标签枚举，会扁平成两层判别字段
+//! （`kind` + `reason`）。这个形状正好能映射成 TypeScript 的可辨识联合，配合
+//! `switch` 的穷尽性检查，Rust 这边加一个状态、前端漏处理就编译不过。这是刻意
+//! 设计的，不是巧合，所以必须钉住。
+
+use apw_core::model::{Availability, Category, Product, Store, Target, UnknownReason};
+use apw_core::watcher::{Event, TroubleAdvice};
+use serde_json::json;
+
+fn to_value<T: serde::Serialize>(v: &T) -> serde_json::Value {
+    serde_json::to_value(v).expect("序列化失败")
+}
+
+#[test]
+fn 可用状态的线上格式() {
+    assert_eq!(
+        to_value(&Availability::InStock),
+        json!({"kind": "in_stock"})
+    );
+    assert_eq!(
+        to_value(&Availability::OutOfStock),
+        json!({"kind": "out_of_stock"})
+    );
+}
+
+#[test]
+fn 未知状态会扁平成两层判别字段() {
+    let cases: Vec<(UnknownReason, serde_json::Value)> = vec![
+        (
+            UnknownReason::NotYetChecked,
+            json!({"kind": "unknown", "reason": "not_yet_checked"}),
+        ),
+        (
+            UnknownReason::Blocked {
+                detail: "HTTP 541".into(),
+            },
+            json!({"kind": "unknown", "reason": "blocked", "detail": "HTTP 541"}),
+        ),
+        (
+            UnknownReason::RateLimited,
+            json!({"kind": "unknown", "reason": "rate_limited"}),
+        ),
+        (
+            UnknownReason::SchemaDrift {
+                field: "pickupDisplay".into(),
+                raw: "weird".into(),
+            },
+            json!({"kind": "unknown", "reason": "schema_drift", "field": "pickupDisplay", "raw": "weird"}),
+        ),
+        (
+            UnknownReason::AppleError {
+                message: "boom".into(),
+            },
+            json!({"kind": "unknown", "reason": "apple_error", "message": "boom"}),
+        ),
+        (
+            UnknownReason::Transport {
+                detail: "timeout".into(),
+            },
+            json!({"kind": "unknown", "reason": "transport", "detail": "timeout"}),
+        ),
+    ];
+
+    for (reason, want) in cases {
+        assert_eq!(
+            to_value(&Availability::Unknown(reason.clone())),
+            want,
+            "{reason:?} 的线上格式变了，前端的 TypeScript 类型需要同步更新"
+        );
+    }
+}
+
+#[test]
+fn 跨边界的结构统一用小驼峰() {
+    // 混用 snake_case 和 camelCase 会让前端每个类型都要单独记住用哪种，
+    // 迟早写错。统一成小驼峰，符合 TypeScript 的习惯。
+    let target = Target {
+        locale: "zh_CN".into(),
+        store_number: "R683".into(),
+        store_title: "上海-环球港".into(),
+        part_number: "MG724CH/A".into(),
+        product_name: "iPhone 17 512GB 黑色".into(),
+        companion_part: None,
+        pickup_location: None,
+    };
+    assert_eq!(
+        to_value(&target),
+        json!({
+            "locale": "zh_CN",
+            "storeNumber": "R683",
+            "storeTitle": "上海-环球港",
+            "partNumber": "MG724CH/A",
+            "productName": "iPhone 17 512GB 黑色"
+        })
+    );
+
+    let product = Product {
+        part_number: "MG724CH/A".into(),
+        category: Category::Iphone,
+        family: "iphone17".into(),
+        capacity: "512GB".into(),
+        color: "黑色".into(),
+        title: "iPhone 17 512GB 黑色".into(),
+        companion_part: None,
+    };
+    let v = to_value(&product);
+    assert!(v.get("partNumber").is_some(), "Product 应当用小驼峰：{v}");
+    // 品类是个纯字符串标签，前端照着它筛下拉框。写成对象或者数字，
+    // TypeScript 那边的联合类型就对不上了。
+    assert_eq!(v.get("category"), Some(&json!("iphone")));
+
+    let store = Store {
+        number: "R683".into(),
+        name: "环球港".into(),
+        title: "上海-环球港".into(),
+        city: "上海".into(),
+        state: "上海".into(),
+        postal_code: "200062".into(),
+    };
+    let v = to_value(&store);
+    assert!(v.get("number").is_some());
+    // 地址字段只在进程内用来拼取货接口的 location，不进 JSON。
+    assert!(v.get("city").is_none() && v.get("state").is_none() && v.get("postalCode").is_none());
+}
+
+#[test]
+fn 品类的线上格式是小写标识符() {
+    // 前端的 Category 联合类型逐字写着这四个串。谁改了 Rust 的 serde 标注，
+    // 这里会先红，而不是等界面上品类下拉框选完什么都筛不出来才发现。
+    for (category, want) in [
+        (Category::Iphone, "iphone"),
+        (Category::Ipad, "ipad"),
+        (Category::Mac, "mac"),
+        (Category::Watch, "watch"),
+    ] {
+        assert_eq!(to_value(&category), json!(want));
+        let back: Category = serde_json::from_value(json!(want)).expect("前端传回来的品类必须认得");
+        assert_eq!(back, category);
+    }
+}
+
+#[test]
+fn 故障建议的线上格式是小写标识符() {
+    // 前端的 TroubleAdvice 联合类型逐字写着这两个串，而界面正是靠它决定要不要
+    // 把「换条网络试试」那句话摆出来。对不上的话，用户看到的还是一句干巴巴的
+    // 「请求被 Apple 拦截」，不知道自己其实有得可做 —— 而这条提示存在的全部
+    // 理由就是让他知道。
+    for (advice, want) in [
+        (TroubleAdvice::TryAnotherNetwork, "try_another_network"),
+        (TroubleAdvice::WaitForUpdate, "wait_for_update"),
+    ] {
+        assert_eq!(to_value(&advice), json!(want));
+    }
+
+    // 没有建议时必须是 null，不能是缺字段 —— 前端按 `advice !== null` 判断。
+    let event = Event::Trouble {
+        reason: "门店 R683 查询失败".into(),
+        advice: None,
+    };
+    let v = to_value(&event);
+    assert_eq!(v.get("advice"), Some(&serde_json::Value::Null));
+    assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("trouble"));
+}
+
+#[test]
+fn 监控目标能原样往返() {
+    // 前端会把 Target 发回来（set_targets），所以它必须是可往返的。
+    let target = Target {
+        locale: "ja_JP".into(),
+        store_number: "R119".into(),
+        store_title: "東京-渋谷".into(),
+        part_number: "MG6A4J/A".into(),
+        product_name: "iPhone 17 256GB ラベンダー".into(),
+        companion_part: None,
+        pickup_location: None,
+    };
+    let json = serde_json::to_string(&target).unwrap();
+    let back: Target = serde_json::from_str(&json).expect("反序列化失败");
+    assert_eq!(target, back);
+}
+
+#[test]
+fn 搭档零件号只在存在时出现且能往返() {
+    // 旧配置和 iPhone 目标没有这个字段：序列化时不能凭空多出一个 null，
+    // 否则每份旧设置一读一写就会被改写；反序列化时缺了也必须能读。
+    let plain: Target = serde_json::from_str(
+        r#"{"locale":"zh_CN","storeNumber":"R683","storeTitle":"上海-环球港","partNumber":"MG724CH/A","productName":"iPhone 17"}"#,
+    )
+    .expect("没有 companionPart 的旧目标应当能读入");
+    assert_eq!(plain.companion_part, None);
+    assert!(to_value(&plain).get("companionPart").is_none());
+
+    let watch = Target {
+        locale: "zh_CN".into(),
+        store_number: "R359".into(),
+        store_title: "上海-南京东路".into(),
+        part_number: "MEHW4CH/B".into(),
+        product_name: "Apple Watch SE 40 毫米 星光色".into(),
+        companion_part: Some("MJUA4FE/A".into()),
+        pickup_location: None,
+    };
+    let v = to_value(&watch);
+    assert_eq!(v.get("companionPart"), Some(&json!("MJUA4FE/A")));
+    let back: Target = serde_json::from_value(v).expect("反序列化失败");
+    assert_eq!(watch, back);
+    // 搭档不参与身份：同一表壳带不带表带都是同一条目标。
+    assert_eq!(watch.key(), plain_with_part(&watch, None).key());
+}
+
+fn plain_with_part(t: &Target, companion: Option<&str>) -> Target {
+    Target {
+        companion_part: companion.map(str::to_string),
+        ..t.clone()
+    }
+}
+
+#[test]
+fn 取货地点只在存在时出现且能往返() {
+    // 和搭档零件号一样：旧配置没有这个字段，读入后不能凭空多出来。
+    let plain: Target = serde_json::from_str(
+        r#"{"locale":"zh_HK","storeNumber":"R499","storeTitle":"香港-Canton Road","partNumber":"MJXW4ZA/A","productName":"iPhone 18 Pro Max"}"#,
+    )
+    .expect("没有 pickupLocation 的旧目标应当能读入");
+    assert_eq!(plain.pickup_location, None);
+    assert!(to_value(&plain).get("pickupLocation").is_none());
+
+    let located = Target {
+        pickup_location: Some("香港".into()),
+        ..plain.clone()
+    };
+    let v = to_value(&located);
+    assert_eq!(v.get("pickupLocation"), Some(&json!("香港")));
+    let back: Target = serde_json::from_value(v).expect("反序列化失败");
+    assert_eq!(located, back);
+    // 地点不参与身份：同一目标带不带地点都是同一条。
+    assert_eq!(located.key(), plain.key());
+}
+
+#[test]
+fn 一轮结束事件的字段用小驼峰() {
+    use apw_core::watcher::Event;
+    // 枚举上的 rename_all 不会落到变体字段上；这个字段是第一个多词字段，
+    // 真实运行时曾经以 next_check_in_secs 发出去，前端对不上就永远不显示节流提示。
+    let v = to_value(&Event::CycleComplete {
+        next_check_in_secs: 45,
+        paced: true,
+        healthy: true,
+        query_group_count: 3,
+        snapshot: Vec::new(),
+    });
+    assert_eq!(v.get("type"), Some(&json!("cycleComplete")));
+    assert_eq!(v.get("nextCheckInSecs"), Some(&json!(45)));
+    assert_eq!(v.get("paced"), Some(&json!(true)));
+    assert_eq!(v.get("queryGroupCount"), Some(&json!(3)));
+    assert!(v.get("next_check_in_secs").is_none(), "{v}");
+}

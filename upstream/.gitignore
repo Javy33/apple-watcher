@@ -1,0 +1,32 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# 前端
+node_modules
+/dist
+/_site/
+dist-ssr
+*.local
+
+# 日志
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Tauri 更新签名私钥。绝对不能提交 —— 泄露等于任何人都能给你的用户推送
+# 一个"合法签名"的更新包。
+*.key
+/.tauri/
+
+# 编辑器与系统
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.swp
+*.sw?
+
+# 生成快照的脚本留下的字节码缓存
+__pycache__/

@@ -1,0 +1,672 @@
+//! Tauri 应用外壳。
+//!
+//! 这一层只做装配和转译：起引擎、把命令转成引擎消息、把引擎事件转发给前端、
+//! 在有货时发提醒。**所有业务判断都在 `apw-core` 里**，这里不许出现任何
+//! 「什么算有货」之类的逻辑 —— 一旦让界面层参与判断，那条核心不变量就多了
+//! 一处可以被绕开的地方。
+//!
+//! 提醒也刻意放在这一层而不是前端：托盘模式下窗口是隐藏的，WebView 可能被
+//! 系统节流甚至挂起，把「及时提醒」挂在一个会被挂起的执行环境上是不能接受的。
+
+use std::sync::RwLock;
+use std::time::Duration;
+
+use apw_core::apple::{AppleClient, ClientConfig};
+use apw_core::catalog::Catalog;
+use apw_core::config::{
+    BarkAlertMode, MIN_INTERVAL_SECONDS, Settings, SettingsStore, UserSettings,
+};
+use apw_core::model::{Category, Product, REGIONS, Store, region_by_locale};
+use apw_core::notify::{Bark, Multi, Notification, Notifier, Sound};
+use apw_core::watcher::{Event, TargetState, Watcher, WatcherConfig};
+use serde::Serialize;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use tauri_plugin_updater::UpdaterExt;
+
+mod auto_open;
+mod notification_queue;
+
+use auto_open::AutoOpenBag;
+
+/// 前端事件通道名。前端用 `listen("watcher://event", ...)` 订阅。
+const EVENT_CHANNEL: &str = "watcher://event";
+/// 启动过程中的降级说明通道：配置读不出来之类的事必须让用户看见。
+const NOTICE_CHANNEL: &str = "watcher://notice";
+
+/// 地区的可序列化形式。
+///
+/// `model::Region` 的字段都是 `&'static str`，而且界面不需要知道 `base_url`
+/// 这类内部细节。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegionDto {
+    title: &'static str,
+    locale: &'static str,
+}
+
+/// 品类的可序列化形式。
+///
+/// 界面上的品类下拉框由这里驱动，而不是在前端另抄一份常量：抄一份就迟早会有
+/// 一边先加了品类、另一边还蒙在鼓里。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategoryDto {
+    value: Category,
+    title: &'static str,
+}
+
+struct AppState {
+    watcher: Watcher,
+    catalog: Catalog,
+    http: reqwest::Client,
+    /// 设置的内存副本。写盘失败不该让界面卡住，所以内存副本是权威的展示来源。
+    settings: RwLock<Settings>,
+    /// 为 `None` 表示配置不可持久化（目录不可写，或上次读取失败已放弃写盘）。
+    store: Option<SettingsStore>,
+}
+
+impl AppState {
+    fn settings_snapshot(&self) -> Settings {
+        self.settings
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
+    }
+
+    /// 更新内存副本并尝试落盘。落盘失败只报错，不回滚内存 ——
+    /// 用户的操作已经生效了，没道理因为磁盘问题把界面弹回去。
+    fn put_settings(&self, next: Settings) -> Result<(), String> {
+        let mut guard = self.settings.write().unwrap_or_else(|e| e.into_inner());
+        *guard = next;
+        let to_save = guard.clone();
+        drop(guard);
+
+        match &self.store {
+            Some(store) => store.save(&to_save).map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+}
+
+#[tauri::command]
+fn list_regions() -> Vec<RegionDto> {
+    REGIONS
+        .iter()
+        .map(|r| RegionDto {
+            title: r.title,
+            locale: r.locale,
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn list_categories() -> Vec<CategoryDto> {
+    Category::ALL
+        .iter()
+        .map(|c| CategoryDto {
+            value: *c,
+            title: c.title(),
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn list_stores(state: tauri::State<'_, AppState>, locale: String) -> Result<Vec<Store>, String> {
+    state.catalog.stores(&locale).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_products(
+    state: tauri::State<'_, AppState>,
+    locale: String,
+) -> Result<Vec<Product>, String> {
+    state.catalog.products(&locale).map_err(|e| e.to_string())
+}
+
+/// 从 Apple 官网抓最新型号，替换该地区该品类的内存副本，返回抓到的型号数。
+///
+/// `category` 为 `None` 时抓该地区的全部购买页。界面传的是当前选中的品类：
+/// 一次只抓那几页，用户想看新出的 Mac 不必等 iPhone、iPad、Watch 一起抓完。
+#[tauri::command]
+async fn refresh_products(
+    state: tauri::State<'_, AppState>,
+    locale: String,
+    category: Option<Category>,
+) -> Result<usize, String> {
+    let region = region_by_locale(&locale).ok_or_else(|| format!("认不出地区 {locale}"))?;
+    state
+        .catalog
+        .refresh_products(region, category, &state.http)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
+    state.settings_snapshot()
+}
+
+#[tauri::command]
+async fn save_settings(
+    state: tauri::State<'_, AppState>,
+    settings: Settings,
+) -> Result<Settings, String> {
+    let mut next = settings;
+    // 新界面的真源是 users；清掉只用于旧版迁移的全局副本，
+    // 否则删除最后一个迁移用户时它会被旧字段再次“复活”。
+    next.targets.clear();
+    next.bark_url.clear();
+    next.normalize();
+    for user in &mut next.users {
+        state.catalog.attach_companions(&mut user.targets);
+        state.catalog.attach_locations(&mut user.targets);
+    }
+
+    // 设置里的目标列表和查询间隔要同步给引擎，否则改完设置监控还按旧的跑。
+    state.watcher.set_targets(next.watch_targets()).await;
+    state.watcher.set_interval(next.interval()).await;
+
+    state.put_settings(next.clone())?;
+    Ok(next)
+}
+
+#[tauri::command]
+async fn get_snapshot(state: tauri::State<'_, AppState>) -> Result<Vec<TargetState>, String> {
+    Ok(state.watcher.snapshot().await)
+}
+
+#[tauri::command]
+async fn set_interval(state: tauri::State<'_, AppState>, seconds: u64) -> Result<u64, String> {
+    let secs = seconds.max(MIN_INTERVAL_SECONDS);
+    state.watcher.set_interval(Duration::from_secs(secs)).await;
+    let mut next = state.settings_snapshot();
+    next.interval_seconds = secs;
+    state.put_settings(next)?;
+    Ok(secs)
+}
+
+#[tauri::command]
+async fn start_watching(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.watcher.start().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_watching(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.watcher.stop().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn is_running(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.watcher.is_running().await)
+}
+
+/// 一个待安装的更新。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    version: String,
+    current_version: String,
+    notes: Option<String>,
+}
+
+/// 查询有没有新版本。返回 `None` 表示已经是最新。
+///
+/// **刻意不做静默自动安装**：给用户装东西这件事应该由用户点头。何况这是个会在
+/// 抢购当口挂着的程序，自作主张地下载、替换、重启，正好会赶上最不该被打断的时刻。
+#[tauri::command]
+async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    match updater.check().await {
+        Ok(Some(update)) => Ok(Some(UpdateInfo {
+            version: update.version.clone(),
+            current_version: update.current_version.clone(),
+            notes: update.body.clone(),
+        })),
+        Ok(None) => Ok(None),
+        // 检查更新失败不是错误状态，只是这次没查到 —— 网络不通、GitHub 抽风都
+        // 会走到这里，没必要弹给用户看，写进日志即可。
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// 下载并安装更新。安装完成后需要重启应用才生效。
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "已经是最新版本".to_string())?;
+
+    let handle = app.clone();
+    update
+        .download_and_install(
+            move |downloaded, total| {
+                // 进度只发给界面，不做任何决策。
+                let _ = handle.emit(
+                    "watcher://update-progress",
+                    serde_json::json!({ "downloaded": downloaded, "total": total }),
+                );
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// 手动试一次提醒，让用户在真正抢购之前确认铃声和推送都通。
+#[tauri::command]
+async fn test_notify(app: AppHandle, user_id: String) -> Result<(), String> {
+    let settings = app
+        .try_state::<AppState>()
+        .map(|state| state.settings_snapshot())
+        .unwrap_or_default();
+    let user = settings
+        .users
+        .iter()
+        .find(|user| user.id == user_id)
+        .ok_or_else(|| "找不到这个用户".to_string())?;
+    let bark_url =
+        bark_url_for_user(user).ok_or_else(|| "请先填写该用户的 Bark 地址".to_string())?;
+    dispatch_notification(
+        &app,
+        Notification::new(
+            format!("{} 提醒测试", user.name),
+            "如果你收到这条，说明 Bark 和提醒方式已生效",
+        ),
+        vec![bark_url],
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// 发出一条提醒：系统通知 + 提示音 + Bark，按用户设置取舍。
+async fn dispatch_notification(
+    app: &AppHandle,
+    notification: Notification,
+    bark_urls: Vec<String>,
+) -> Result<(), apw_core::notify::NotifyError> {
+    let settings = match app.try_state::<AppState>() {
+        Some(state) => state.settings_snapshot(),
+        None => return Ok(()),
+    };
+
+    // 系统通知总是发。它是最轻量也最可靠的一条，没有理由让用户关掉它之后
+    // 就完全收不到东西。
+    emit_system_notification(app, &notification);
+
+    let mut channels = Multi::new();
+    if settings.sound_enabled {
+        channels.push(Sound::embedded());
+    }
+    let http = app
+        .try_state::<AppState>()
+        .map(|s| s.http.clone())
+        .unwrap_or_default();
+    for bark_url in bark_urls {
+        channels.push(Bark::new(bark_url, http.clone()));
+    }
+    if channels.is_empty() {
+        return Ok(());
+    }
+    channels.notify(&notification).await
+}
+
+fn bark_url_for_user(user: &UserSettings) -> Option<String> {
+    let raw = user.bark_url.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        // 保留原值交给 Bark 通道报出可见的配置错误，不静默跳过。
+        return Some(raw.to_string());
+    };
+    let replaced = ["level", "call", "sound", "volume", "group", "isArchive"];
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| !replaced.contains(&key.as_ref()))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    pairs.push((
+        "level".into(),
+        match user.alert_mode {
+            BarkAlertMode::Passive => "passive",
+            BarkAlertMode::Active => "active",
+            BarkAlertMode::TimeSensitive => "timeSensitive",
+            BarkAlertMode::Critical => "critical",
+        }
+        .into(),
+    ));
+    if user.alert_mode == BarkAlertMode::Critical {
+        pairs.extend([
+            ("call".into(), "1".into()),
+            ("sound".into(), "alarm".into()),
+            ("volume".into(), "10".into()),
+        ]);
+    }
+    pairs.extend([
+        ("group".into(), format!("Apple-{}", user.name)),
+        ("isArchive".into(), "1".into()),
+    ]);
+    url.set_query(None);
+    url.query_pairs_mut().extend_pairs(pairs);
+    Some(url.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn 闹钟配置覆盖旧参数并保留其他_bark_设置() {
+        let user = UserSettings {
+            name: "MY VIP".into(),
+            bark_url: "https://api.day.app/key?level=passive&icon=https%3A%2F%2Fx.test%2Fi.png"
+                .into(),
+            alert_mode: BarkAlertMode::Critical,
+            ..UserSettings::default()
+        };
+        let url = reqwest::Url::parse(&bark_url_for_user(&user).unwrap()).unwrap();
+        let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query.get("level").map(String::as_str), Some("critical"));
+        assert_eq!(query.get("call").map(String::as_str), Some("1"));
+        assert_eq!(query.get("sound").map(String::as_str), Some("alarm"));
+        assert_eq!(query.get("volume").map(String::as_str), Some("10"));
+        assert_eq!(query.get("group").map(String::as_str), Some("Apple-MY VIP"));
+        assert_eq!(
+            query.get("icon").map(String::as_str),
+            Some("https://x.test/i.png")
+        );
+    }
+}
+
+fn emit_system_notification(app: &AppHandle, n: &Notification) {
+    use tauri_plugin_notification::NotificationExt;
+    // 通知发不出去（用户在系统里关了权限）不该影响其他渠道，也不该让流程中断。
+    if let Err(err) = app
+        .notification()
+        .builder()
+        .title(&n.title)
+        .body(&n.body)
+        .show()
+    {
+        let _ = app.emit(NOTICE_CHANNEL, format!("系统通知发送失败：{err}"));
+    }
+}
+
+/// 消费引擎事件：转发给前端，并在有货时发提醒。
+async fn pump_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<Event>) {
+    let mut auto_open_bag = AutoOpenBag::default();
+    let (notifications, pending) = notification_queue::channel();
+    let notification_app = app.clone();
+    tauri::async_runtime::spawn(notification_queue::run(
+        pending,
+        move |(notification, bark_urls)| {
+            let app = notification_app.clone();
+            async move {
+                if let Err(err) = dispatch_notification(&app, notification, bark_urls).await {
+                    let _ = app.emit(NOTICE_CHANNEL, format!("发送提醒时出错：{err}"));
+                }
+            }
+        },
+    ));
+
+    while let Some(event) = events.recv().await {
+        // 先原样转发。前端拿到的事件流应当与引擎发出的完全一致，
+        // 中间少一层可能出错的翻译。
+        let _ = app.emit(EVENT_CHANNEL, &event);
+
+        if let Event::RunStateChanged { running } = &event {
+            auto_open_bag.on_run_state_changed(*running);
+        }
+
+        if let Event::InStock { state } = &event {
+            let target = &state.target;
+            let notification = Notification::new(
+                "有货了",
+                format!("{} {}", target.store_title, target.product_name),
+            );
+            let notification = match region_by_locale(&target.locale) {
+                Some(region) => notification.with_url(region.bag_url()),
+                None => notification,
+            };
+
+            let settings = app
+                .try_state::<AppState>()
+                .map(|s| s.settings_snapshot())
+                .unwrap_or_default();
+            let bark_urls = settings
+                .users
+                .iter()
+                .filter(|user| {
+                    user.targets
+                        .iter()
+                        .any(|candidate| candidate.key() == target.key())
+                })
+                .filter_map(bark_url_for_user)
+                .collect();
+
+            use tauri_plugin_opener::OpenerExt;
+            if let Err(err) =
+                auto_open_bag.open_if_needed(settings.open_bag_on_hit, &target.locale, |url| {
+                    app.opener().open_url(url, None::<&str>)
+                })
+            {
+                let _ = app.emit(NOTICE_CHANNEL, format!("打开购物袋失败：{err}"));
+            }
+
+            // 不逐项等待网络推送，否则15个Bark超时会让快照和暂停状态迟到150秒。
+            // 队列满时保留背压，不丢提醒，也不无限创建后台任务。
+            if notifications.send((notification, bark_urls)).await.is_err() {
+                let _ = app.emit(NOTICE_CHANNEL, "提醒发送任务已停止，无法发送到货提醒");
+            }
+        }
+    }
+}
+
+/// 建系统托盘。
+///
+/// 关窗口时不退出而是收进托盘：这个工具的正常用法就是挂上几个小时等发售，
+/// 让它一直占着一个窗口和 Dock 图标没有道理。
+fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    TrayIconBuilder::with_id("main")
+        .icon(
+            app.default_window_icon().cloned().ok_or_else(|| {
+                tauri::Error::AssetNotFound("默认窗口图标缺失，无法建立托盘".into())
+            })?,
+        )
+        .tooltip("Apple Pickup Watcher")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => reveal_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                reveal_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+fn reveal_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// 载入设置。读不出来时放弃写盘并留档原文件。
+///
+/// 这一条是刻意的：读不到旧配置**不等于**用户没有配置。若照常写盘，界面初始化
+/// 时的几次控件赋值就会把仅存的那份原子替换成一份空的默认配置，监控列表再也
+/// 找不回来。Go 版正是这么丢过数据。
+fn load_settings(notices: &mut Vec<String>) -> (Settings, Option<SettingsStore>) {
+    let store = match SettingsStore::new() {
+        Ok(s) => s,
+        Err(err) => {
+            notices.push(format!("配置目录不可用，本次运行的设置不会被保存：{err}"));
+            return (Settings::default(), None);
+        }
+    };
+
+    // 「新版配置文件还不存在」才是首次运行的判据。
+    //
+    // 不能用「目标列表为空」代替：用户删光目标后保存的是一份合法的空目标配置，
+    // 而旧版 settings.json 是刻意保留不删的（为了能回退），于是下次启动会把他
+    // 亲手删掉的目标连同 locale、Bark 地址一起原样倒回来。
+    let first_run = store.path().symlink_metadata().is_err();
+
+    match store.load() {
+        Ok(settings) => {
+            if first_run
+                && let Some(legacy) = store.import_legacy()
+                && !legacy.targets.is_empty()
+            {
+                notices.push(format!(
+                    "已从旧版设置迁移了 {} 条监控目标。",
+                    legacy.targets.len()
+                ));
+                // 立刻落盘。否则用户不改任何设置时新版文件一直不存在，
+                // 每次启动都要重迁一遍，用户删掉的目标也会一直复活。
+                if let Err(err) = store.save(&legacy) {
+                    notices.push(format!("迁移结果暂时没能保存：{err}"));
+                }
+                return (legacy, Some(store));
+            }
+            (settings, Some(store))
+        }
+        Err(err) => {
+            match store.preserve_corrupted() {
+                Ok(Some(path)) => {
+                    notices.push(format!("读取设置失败，原文件已备份到 {}", path.display()))
+                }
+                Ok(None) => {}
+                Err(backup_err) => {
+                    notices.push(format!("读取设置失败，且无法备份原文件：{backup_err}"));
+                }
+            }
+            notices.push(format!(
+                "读取设置失败，已回退到默认设置，并且本次运行不会覆盖磁盘上的配置：{err}"
+            ));
+            (Settings::default(), None)
+        }
+    }
+}
+
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(|app| {
+            let mut notices = Vec::new();
+            let (mut settings, store) = load_settings(&mut notices);
+
+            // 旧版本保存的 Apple Watch 目标没有搭档表带，查出来会是假的
+            // 「无货」；启动时按目录补齐，下次写盘就带上了。
+            let catalog = Catalog::new();
+            for user in &mut settings.users {
+                catalog.attach_companions(&mut user.targets);
+                catalog.attach_locations(&mut user.targets);
+            }
+
+            let client = AppleClient::new(ClientConfig::default())
+                .map_err(|e| format!("构造 Apple 客户端失败：{e}"))?;
+
+            // 用 Watcher::new 而不是 Watcher::spawn：setup 回调跑在主线程上，
+            // 并不处在 tokio 运行时上下文里，在这里 tokio::spawn 会 panic，
+            // 而且因为发生在不可展开的回调中，进程会直接 abort。
+            // 引擎任务交给 Tauri 自己的运行时去驱动。
+            let (watcher, events, engine) = Watcher::new(client, WatcherConfig::default());
+            tauri::async_runtime::spawn(engine);
+
+            {
+                let watcher = watcher.clone();
+                let targets = settings.watch_targets();
+                let interval = settings.interval();
+                tauri::async_runtime::spawn(async move {
+                    watcher.set_targets(targets).await;
+                    watcher.set_interval(interval).await;
+                });
+            }
+
+            app.manage(AppState {
+                watcher,
+                catalog,
+                http: reqwest::Client::new(),
+                settings: RwLock::new(settings),
+                store,
+            });
+
+            let handle: AppHandle = app.handle().clone();
+            tauri::async_runtime::spawn(pump_events(handle.clone(), events));
+
+            if let Err(err) = setup_tray(&handle) {
+                // 托盘建不起来只是少一项能力，不该让程序起不来。
+                notices.push(format!("系统托盘不可用：{err}"));
+            }
+
+            if !notices.is_empty() {
+                // 界面还没订阅上，稍等一下再发。这些是降级说明，用户必须看见 ——
+                // 只写到 stderr 是没用的，用户是双击图标启动的。
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    for notice in notices {
+                        let _ = handle.emit(NOTICE_CHANNEL, notice);
+                    }
+                });
+            }
+
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // 收进托盘而不是退出。真要退出走托盘菜单里的「退出」。
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            list_regions,
+            list_categories,
+            list_stores,
+            list_products,
+            refresh_products,
+            get_settings,
+            save_settings,
+            get_snapshot,
+            set_interval,
+            start_watching,
+            stop_watching,
+            is_running,
+            test_notify,
+            check_for_update,
+            install_update,
+        ])
+        .run(tauri::generate_context!())
+        .expect("Tauri 应用启动失败");
+}

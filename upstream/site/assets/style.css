@@ -1,0 +1,94 @@
+:root {
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 15px;
+  color: #25282c;
+  background: #fff;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+a { color: #285b93; text-underline-offset: 3px; }
+a:hover { color: #173b62; }
+a:focus-visible, summary:focus-visible { outline: 2px solid #285b93; outline-offset: 4px; }
+p { margin: 0 0 16px; line-height: 1.8; }
+h1, h2 { margin-top: 0; }
+.page { width: min(960px, calc(100% - 64px)); margin-inline: auto; }
+.skip { position: absolute; top: -60px; left: 16px; padding: 10px; background: #fff; }
+.skip:focus { top: 10px; }
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  padding-block: 28px;
+  border-bottom: 1px solid #e6e7e9;
+  font-size: 13px;
+}
+.header a { color: #61666d; text-decoration: none; }
+.header a:hover { text-decoration: underline; }
+.header a:last-child { flex-shrink: 0; }
+.intro { padding-block: 48px 40px; }
+h1 { margin-bottom: 12px; font-size: 42px; font-weight: 650; letter-spacing: -1.4px; line-height: 1.15; }
+.subtitle { margin-bottom: 18px; color: #50565d; font-size: 20px; line-height: 1.5; }
+.description { max-width: 690px; margin-bottom: 24px; }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 24px; font-size: 14px; }
+.download-button { padding: 10px 17px; border: 1px solid #25282c; border-radius: 4px; background: #25282c; color: white; text-decoration: none; font-weight: 550; }
+.download-button:hover { color: #fff; background: #44494f; }
+.screenshot { display: block; width: 100%; max-width: 900px; height: auto; margin-top: 36px; border: 1px solid #e6e7e9; border-radius: 10px; }
+
+.section {
+  display: grid;
+  grid-template-columns: 170px minmax(0, 1fr);
+  gap: 35px;
+  padding-block: 32px;
+  border-top: 1px solid #e6e7e9;
+}
+.section h2 { margin-bottom: 0; font-size: 16px; font-weight: 650; line-height: 1.65; }
+.section > :last-child { min-width: 0; }
+.section p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; margin: 22px 0 14px; font-size: 14px; text-align: left; }
+th, td { border-bottom: 1px solid #e6e7e9; padding: 12px 12px 12px 0; line-height: 1.6; }
+th { font-weight: 600; }
+thead th { color: #737982; font-size: 12px; font-weight: 400; padding-top: 0; }
+td:last-child, th:last-child { padding-right: 0; text-align: right; white-space: nowrap; }
+tbody th { width: 22%; }
+.note { color: #6a7077; font-size: 13px; line-height: 1.8; }
+.facts { display: grid; grid-template-columns: 55px minmax(0, 1fr); gap: 10px 16px; margin: 0 0 18px; line-height: 1.8; }
+.facts dt { color: #6a7077; }
+.facts dd { margin: 0; }
+.instructions { margin: 0; padding-left: 21px; line-height: 1.8; }
+.instructions li { padding-left: 3px; margin-bottom: 13px; }
+.instructions li:last-child { margin-bottom: 0; }
+.instructions strong { font-weight: 600; }
+.behavior { margin: 0; line-height: 1.8; }
+.behavior dt { margin-bottom: 4px; font-weight: 600; }
+.behavior dd { margin: 0 0 18px; color: #50565d; }
+.behavior dd:last-child { margin-bottom: 0; }
+
+.questions details { border-bottom: 1px solid #e6e7e9; }
+.questions details:last-child { border-bottom: 0; }
+.questions summary { padding-block: 14px; cursor: pointer; font-size: 14px; line-height: 1.7; }
+.questions details:first-child summary { padding-top: 1px; }
+.questions details p { padding: 0 0 15px 16px; margin: 0; color: #50565d; font-size: 14px; }
+.links { display: flex; flex-wrap: wrap; gap: 10px 24px; list-style: none; padding: 0; margin: 0; font-size: 13px; line-height: 1.7; }
+.footer { border-top: 1px solid #e6e7e9; padding-block: 26px 36px; color: #777d84; font-size: 12px; }
+.footer p { margin-bottom: 12px; }
+.footer a { color: inherit; }
+.footer .links { font-size: 12px; }
+
+@media (max-width: 720px) {
+  .page { width: calc(100% - 40px); }
+  .header { padding-block: 22px; font-size: 11px; gap: 14px; }
+  .intro { padding-block: 32px; }
+  h1 { font-size: 34px; letter-spacing: -.9px; max-width: 430px; }
+  .subtitle { font-size: 17px; }
+  .description { font-size: 14px; }
+  .section { grid-template-columns: minmax(0, 1fr); gap: 18px; padding-block: 26px; }
+  .section h2 { font-size: 17px; }
+  th, td { font-size: 12px; }
+  tbody th { width: 23%; }
+  .facts { grid-template-columns: 48px minmax(0, 1fr); gap: 10px; font-size: 14px; }
+  .instructions, .behavior { font-size: 14px; }
+}

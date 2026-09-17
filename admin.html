@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Apple VIP 库存队列</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, "Microsoft YaHei", sans-serif; color:#172033; background:#f4f6fa }
+    * { box-sizing:border-box }
+    body { margin:0; padding:32px 18px 60px }
+    main { max-width:1180px; margin:auto }
+    header,.toolbar,.user,.empty { background:#fff; border:1px solid #dfe4ee; border-radius:16px; box-shadow:0 8px 28px rgba(21,35,60,.06) }
+    header { display:flex; justify-content:space-between; gap:20px; align-items:center; padding:22px 24px; margin-bottom:16px }
+    h1 { font-size:22px; margin:0 0 5px }
+    h2 { font-size:17px; margin:0 }
+    p { margin:0; color:#667085; font-size:13px }
+    button,input,select { font:inherit }
+    button { border:1px solid #cfd6e4; border-radius:9px; padding:9px 13px; background:#fff; cursor:pointer; color:#253047 }
+    button:hover { background:#f5f7fb }
+    button.primary { color:#fff; background:#1f64e5; border-color:#1f64e5; font-weight:650 }
+    button.danger { color:#bb2737 }
+    button:disabled { opacity:.55; cursor:not-allowed }
+    .status { border-radius:99px; padding:7px 11px; font-size:12px; font-weight:700; background:#fff1cc; color:#865900 }
+    .status.running { background:#dff7e9; color:#147444 }
+    .status.blocked { background:#fee4e2; color:#b42318 }
+    .metrics { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:10px; margin-bottom:16px }
+    .metric { background:#fff; border:1px solid #dfe4ee; border-radius:13px; padding:13px 15px }
+    .metric span { display:block; color:#667085; font-size:11px; margin-bottom:5px }
+    .metric strong { font-size:18px; color:#172033 }
+    .toolbar { display:flex; align-items:end; flex-wrap:wrap; gap:12px; padding:16px 18px; margin-bottom:16px }
+    label { display:grid; gap:6px; color:#475467; font-size:12px; font-weight:650 }
+    input,select { min-width:0; width:100%; border:1px solid #cfd6e4; border-radius:9px; padding:9px 10px; background:#fff; color:#172033 }
+    input:focus,select:focus { outline:3px solid #dce8ff; border-color:#5b8def }
+    .spacer { flex:1 }
+    #message { min-height:20px; margin:3px 2px 12px; color:#475467; font-size:13px }
+    #message.error { color:#b42318 }
+    #users { display:grid; gap:14px }
+    .user { padding:18px }
+    .user-head { display:grid; grid-template-columns:minmax(150px,1fr) minmax(260px,2fr) 180px auto; gap:12px; align-items:end; margin-bottom:18px }
+    .actions { display:flex; gap:7px; white-space:nowrap }
+    table { width:100%; border-collapse:collapse; table-layout:fixed }
+    th { text-align:left; color:#667085; font-size:12px; font-weight:650; padding:0 6px 8px }
+    td { border-top:1px solid #edf0f5; padding:10px 6px; vertical-align:middle }
+    td:nth-child(1) { width:120px } td:nth-child(2) { width:130px } td:nth-child(3) { width:170px } td:nth-child(4) { width:auto } td:nth-child(5) { width:165px } td:nth-child(6) { width:120px } td:nth-child(7) { width:54px }
+    .availability { font-size:12px; font-weight:700; color:#667085 }
+    .availability.in_stock { color:#07883e }
+    .availability.out_of_stock { color:#596276 }
+    .availability.unknown { color:#b54708 }
+    .target-actions { margin-top:11px }
+    .empty { text-align:center; padding:42px; color:#667085 }
+    .hint { margin-top:16px; color:#667085; font-size:12px }
+    code { background:#edf1f7; border-radius:5px; padding:2px 5px }
+    @media (max-width:850px) {
+      body { padding:16px 10px 40px }
+      .user-head { grid-template-columns:1fr }
+      .table-wrap { overflow:auto }
+      table { min-width:1020px }
+      .spacer { display:none }
+      .metrics { grid-template-columns:repeat(2,minmax(0,1fr)) }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><h1>Apple VIP 库存队列</h1><p>60 秒轮询 · 双节点每 20 轮换 IP · Query Group 去重</p></div>
+    <span id="serverStatus" class="status">连接中</span>
+  </header>
+
+  <section class="metrics">
+    <div class="metric"><span>VIP</span><strong id="vipCount">—</strong></div>
+    <div class="metric"><span>Query Groups</span><strong id="groupCount">—</strong></div>
+    <div class="metric"><span>当前节点 Apple HTTP</span><strong id="requestCount">—</strong></div>
+    <div class="metric"><span>541 次数 / 比例</span><strong id="error541">—</strong></div>
+    <div class="metric"><span>连续 541</span><strong id="consecutive541">—</strong></div>
+    <div class="metric"><span>最近成功查询</span><strong id="lastSuccess">—</strong></div>
+  </section>
+
+  <section class="toolbar">
+    <span>60 秒固定 Slot；每个 VIP 最多 2 个机型</span>
+    <span class="spacer"></span>
+    <button id="reload">重新读取</button>
+    <button id="addUser">＋ 添加 VIP</button>
+    <button id="save" class="primary">保存并更新服务器</button>
+  </section>
+  <div id="message"></div>
+  <section id="users"><div class="empty">正在读取服务器配置…</div></section>
+  <p class="hint">主节点与可选工作节点每 20 轮（约 20 分钟）切换；非活跃节点不请求 Apple，通知只由主节点发送。</p>
+</main>
+
+<datalist id="locales">
+  <option value="en_MY">马来西亚</option><option value="zh_HK">香港</option>
+  <option value="zh_CN">中国大陆</option><option value="en_SG">新加坡</option>
+  <option value="zh_TW">台湾</option><option value="ja_JP">日本</option>
+</datalist>
+
+<script>
+let config = null;
+let status = { running:false, snapshot:[], generation:0, metrics:{}, queryGroups:[] };
+const usersNode = document.querySelector('#users');
+const messageNode = document.querySelector('#message');
+const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const key = target => `${target.locale}|${target.storeNumber}|${target.partNumber}`;
+
+function setMessage(text, error=false) {
+  messageNode.textContent = text;
+  messageNode.className = error ? 'error' : '';
+}
+
+async function api(path, options={}) {
+  const response = await fetch(path, options);
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+  return body;
+}
+
+function render() {
+  if (!config.users.length) {
+    usersNode.innerHTML = '<div class="empty">还没有 VIP。点击“添加 VIP”开始配置。</div>';
+    return;
+  }
+  usersNode.innerHTML = config.users.map(user => `
+    <article class="user" data-user="${esc(user.id)}">
+      <div class="user-head">
+        <label>VIP 名称<input data-field="name" value="${esc(user.name)}" maxlength="80"></label>
+        <label>Bark 推送地址<input data-field="barkUrl" type="password" autocomplete="off" placeholder="https://api.day.app/设备Key" value="${esc(user.barkUrl)}"></label>
+        <label>提醒方式<select data-field="alertMode">
+          <option value="passive" ${user.alertMode==='passive'?'selected':''}>静默</option>
+          <option value="active" ${user.alertMode==='active'?'selected':''}>普通</option>
+          <option value="timeSensitive" ${user.alertMode==='timeSensitive'?'selected':''}>时效性</option>
+          <option value="critical" ${user.alertMode==='critical'?'selected':''}>闹钟</option>
+        </select></label>
+        <div class="actions"><button data-action="test">测试 Bark</button><button data-action="remove-user" class="danger">删除</button></div>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>地区代码</th><th>门店编号</th><th>SKU</th><th>显示名称</th><th>服务器状态</th><th>距下次执行</th><th></th></tr></thead>
+        <tbody>${user.targets.map((target,index) => `
+          <tr data-target="${index}">
+            <td><input data-target-field="locale" list="locales" value="${esc(target.locale)}"></td>
+            <td><input data-target-field="storeNumber" placeholder="R742" value="${esc(target.storeNumber)}"></td>
+            <td><input data-target-field="partNumber" placeholder="MJXU4X/A" value="${esc(target.partNumber)}"></td>
+            <td><input data-target-field="productName" data-name-key="${esc(key(target))}" placeholder="可留空，由目录补全" value="${esc(target.productName)}"></td>
+            <td><span class="availability" data-status-key="${esc(key(target))}">待查询</span></td>
+            <td><span class="availability" data-next-key="${esc(key(target))}">—</span></td>
+            <td><button data-action="remove-target" class="danger" aria-label="删除目标">×</button></td>
+          </tr>`).join('')}</tbody>
+      </table></div>
+      <div class="target-actions"><button data-action="add-target">＋ 添加监控机型</button></div>
+    </article>`).join('');
+  paintStatus();
+}
+
+function paintStatus() {
+  const badge = document.querySelector('#serverStatus');
+  const metrics = status.metrics || {};
+  badge.textContent = metrics.circuitOpen ? '541 熔断中' : status.running ? `${status.activeNode || '未知节点'} · ${status.nodeCycle || 0}/${status.cyclesPerNode || 20}` : '监控未运行';
+  badge.className = `status${metrics.circuitOpen ? ' blocked' : status.running ? ' running' : ''}`;
+  const requests = metrics.requestsLastHour || 0;
+  const blocked = metrics.responses541LastHour || 0;
+  document.querySelector('#vipCount').textContent = status.vipCount ?? '—';
+  document.querySelector('#groupCount').textContent = status.queryGroupCount ?? '—';
+  document.querySelector('#requestCount').textContent = requests;
+  document.querySelector('#error541').textContent = `${blocked} / ${requests ? (blocked * 100 / requests).toFixed(1) : '0.0'}%`;
+  document.querySelector('#consecutive541').textContent = metrics.consecutive541 || 0;
+  document.querySelector('#lastSuccess').textContent = metrics.lastSuccessAtMs ? new Date(metrics.lastSuccessAtMs).toLocaleTimeString() : '—';
+  const states = new Map((status.snapshot || []).map(item => [key(item.target), item]));
+  const groups = status.queryGroups || [];
+  document.querySelectorAll('[data-status-key]').forEach(node => {
+    const item = states.get(node.dataset.statusKey);
+    const availability = item?.availability;
+    node.className = `availability ${availability?.kind || ''}`;
+    if (!availability || availability.kind === 'unknown' && availability.reason === 'not_yet_checked') node.textContent = '待查询';
+    else if (availability.kind === 'in_stock') node.textContent = '有货';
+    else if (availability.kind === 'out_of_stock') node.textContent = '无货';
+    else node.textContent = `未知 · ${availability.reason || '查询失败'}`;
+    node.title = availability?.detail || '';
+  });
+  document.querySelectorAll('[data-name-key]').forEach(node => {
+    const item = states.get(node.dataset.nameKey);
+    if (!node.value && item?.target?.productName) node.placeholder = item.target.productName;
+  });
+  document.querySelectorAll('[data-next-key]').forEach(node => {
+    const [locale, store, part] = node.dataset.nextKey.split('|');
+    const group = groups.find(item => item.locale === locale && item.partNumbers.includes(part) && item.stores.includes(store));
+    if (!group?.nextCheckAtMs) node.textContent = '待排程';
+    else node.textContent = `${Math.max(0, Math.ceil((group.nextCheckAtMs - Date.now()) / 1000))} 秒`;
+  });
+  if (status.lastError) setMessage(status.lastError, true);
+}
+
+async function load() {
+  try {
+    config = await api('/api/config');
+    setMessage('已读取服务器配置。');
+    render();
+    await loadStatus();
+  } catch (error) {
+    setMessage(`无法读取服务器：${error.message}`, true);
+  }
+}
+
+async function loadStatus() {
+  try { status = await api('/api/status'); paintStatus(); }
+  catch (error) { setMessage(`服务器状态读取失败：${error.message}`, true); }
+}
+
+async function save() {
+  config.intervalSeconds = 90;
+  try {
+    config = await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config)});
+    setMessage('已保存；查询目标变化时自动热重载，提醒设置会直接生效。');
+    render();
+    setTimeout(loadStatus, 800);
+    return true;
+  } catch (error) {
+    setMessage(`保存失败：${error.message}`, true);
+    return false;
+  }
+}
+
+usersNode.addEventListener('input', event => {
+  const card = event.target.closest('[data-user]');
+  if (!card) return;
+  const user = config.users.find(item => item.id === card.dataset.user);
+  const row = event.target.closest('[data-target]');
+  if (row && event.target.dataset.targetField) user.targets[Number(row.dataset.target)][event.target.dataset.targetField] = event.target.value;
+  else if (event.target.dataset.field) user[event.target.dataset.field] = event.target.value;
+});
+
+usersNode.addEventListener('click', async event => {
+  const button = event.target.closest('button[data-action]');
+  if (!button) return;
+  const card = button.closest('[data-user]');
+  const user = config.users.find(item => item.id === card.dataset.user);
+  if (button.dataset.action === 'add-target') user.targets.push({locale:'en_MY',storeNumber:'',partNumber:'',storeTitle:'',productName:''});
+  if (button.dataset.action === 'remove-target') user.targets.splice(Number(button.closest('[data-target]').dataset.target), 1);
+  if (button.dataset.action === 'remove-user' && confirm(`删除 ${user.name} 及其全部目标？`)) config.users = config.users.filter(item => item.id !== user.id);
+  if (button.dataset.action === 'test' && await save()) {
+    try { await api('/api/test-bark', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:user.id})}); setMessage(`${user.name} 的 Bark 测试已发送。`); }
+    catch (error) { setMessage(`Bark 测试失败：${error.message}`, true); }
+    return;
+  }
+  render();
+});
+
+document.querySelector('#addUser').addEventListener('click', () => {
+  config.users.push({id:crypto.randomUUID(),name:`VIP-${config.users.length+1}`,barkUrl:'',alertMode:'active',targets:[]});
+  render();
+});
+document.querySelector('#save').addEventListener('click', save);
+document.querySelector('#reload').addEventListener('click', load);
+load();
+setInterval(loadStatus, 5000);
+</script>
+</body>
+</html>

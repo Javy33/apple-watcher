@@ -1,0 +1,1204 @@
+//! 调度引擎的测试。
+//!
+//! 每一条基本都对应 Go 版踩过的一个坑。用假的 Fetcher，不碰网络。
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use apw_core::apple::{ApiError, Fetcher, PartStatus, StoreAvailability};
+use apw_core::model::{Availability, Region, Target, UnknownReason};
+use apw_core::watcher::{Event, Watcher, WatcherConfig};
+use tokio::sync::Mutex;
+use tokio::sync::mpsc::Receiver;
+
+/// 假查询源的应答函数：入参依次是「第几次调用」「门店号」「请求的零件号」。
+type Responder =
+    Arc<dyn Fn(usize, &str, &[String]) -> Result<StoreAvailability, ApiError> + Send + Sync>;
+/// 按地点查询的记录：(地点, 请求的零件号)。
+type NearbyLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+/// 按地点查询的应答函数：入参依次是「第几次调用」「地点」「请求的零件号」。
+type NearbyResponder =
+    Arc<dyn Fn(usize, &str, &[String]) -> Result<Vec<StoreAvailability>, ApiError> + Send + Sync>;
+
+/// 假的查询源，可编程返回值，并记录调用情况。
+#[derive(Clone)]
+struct FakeFetcher {
+    calls: Arc<AtomicUsize>,
+    /// 同一时刻在飞的查询数峰值。只盯一个门店时，一条循环任何时候最多一次在飞，
+    /// 峰值超过 1 就只能是同时存在两条循环。
+    in_flight: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+    /// 每次调用记录下收到的零件号，用于验证「按门店合并请求」。
+    seen_parts: Arc<Mutex<Vec<Vec<String>>>>,
+    /// 按地点查询的记录：(地点, 零件号)，用于验证「按地点合并请求」。
+    seen_nearby: NearbyLog,
+    delay: Duration,
+    responder: Responder,
+    nearby: NearbyResponder,
+    /// `pacing_delay` 的返回值，模拟客户端的请求预算。
+    pacing: Duration,
+}
+
+impl FakeFetcher {
+    fn new(
+        responder: impl Fn(usize, &str, &[String]) -> Result<StoreAvailability, ApiError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            seen_parts: Arc::new(Mutex::new(Vec::new())),
+            seen_nearby: Arc::new(Mutex::new(Vec::new())),
+            delay: Duration::from_millis(5),
+            responder: Arc::new(responder),
+            nearby: Arc::new(|_, location, _| {
+                Err(ApiError::Transport(format!(
+                    "测试没有设置按地点查询的应答：{location}"
+                )))
+            }),
+            pacing: Duration::ZERO,
+        }
+    }
+
+    fn with_nearby(
+        mut self,
+        nearby: impl Fn(usize, &str, &[String]) -> Result<Vec<StoreAvailability>, ApiError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.nearby = Arc::new(nearby);
+        self
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn peak_in_flight(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+impl Fetcher for FakeFetcher {
+    async fn pickup_message(
+        &self,
+        _region: &'static Region,
+        store_number: &str,
+        parts: &[String],
+    ) -> Result<StoreAvailability, ApiError> {
+        let nth = self.calls.fetch_add(1, Ordering::SeqCst);
+        // 必须用 guard 来减计数，不能在函数末尾手动减。
+        //
+        // 引擎停止时会直接丢弃在飞的查询 future（Rust 里丢弃即取消），末尾那行
+        // 根本没机会执行，计数会一路泄漏 —— 第一版就是这么写的，结果峰值恰好
+        // 等于循环次数，看上去像引擎跑出了二十条循环。Drop 在取消路径上照样执行。
+        let _guard = InFlightGuard::enter(&self.in_flight, &self.peak);
+        self.seen_parts.lock().await.push(parts.to_vec());
+
+        tokio::time::sleep(self.delay).await;
+        (self.responder)(nth, store_number, parts)
+    }
+
+    async fn pickup_message_nearby(
+        &self,
+        _region: &'static Region,
+        location: &str,
+        parts: &[String],
+    ) -> Result<Vec<StoreAvailability>, ApiError> {
+        let nth = self.calls.fetch_add(1, Ordering::SeqCst);
+        let _guard = InFlightGuard::enter(&self.in_flight, &self.peak);
+        self.seen_nearby
+            .lock()
+            .await
+            .push((location.to_string(), parts.to_vec()));
+
+        tokio::time::sleep(self.delay).await;
+        (self.nearby)(nth, location, parts)
+    }
+
+    async fn pacing_delay(&self, _requests: usize) -> Duration {
+        self.pacing
+    }
+}
+
+/// 在飞计数的 RAII guard：无论正常返回还是被取消，都会把计数减回去。
+struct InFlightGuard {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl InFlightGuard {
+    fn enter(in_flight: &Arc<AtomicUsize>, peak: &Arc<AtomicUsize>) -> Self {
+        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(now, Ordering::SeqCst);
+        Self {
+            in_flight: Arc::clone(in_flight),
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn ok_response(store: &str, parts: &[String], availability: Availability) -> StoreAvailability {
+    let mut map = BTreeMap::new();
+    for p in parts {
+        map.insert(
+            p.clone(),
+            PartStatus {
+                part_number: p.clone(),
+                availability: availability.clone(),
+                product_title: Some("iPhone 17".into()),
+                pickup_display: "available".into(),
+            },
+        );
+    }
+    StoreAvailability {
+        store_number: store.to_string(),
+        store_name: "环球港".into(),
+        parts: map,
+    }
+}
+
+fn target(store: &str, part: &str) -> Target {
+    Target {
+        locale: "zh_CN".into(),
+        store_number: store.into(),
+        store_title: format!("上海-{store}"),
+        part_number: part.into(),
+        product_name: format!("型号 {part}"),
+        companion_part: None,
+        pickup_location: None,
+    }
+}
+
+fn fast_config() -> WatcherConfig {
+    WatcherConfig {
+        interval: Duration::from_millis(20),
+        jitter: 0.0,
+        concurrency: 4,
+        event_buffer: 256,
+        one_group_per_slot: false,
+    }
+}
+
+/// 等到至少收到一次 CycleComplete，返回这期间的全部事件。
+async fn wait_cycle(rx: &mut Receiver<Event>) -> Vec<Event> {
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "等一轮查询结束超时，已收到 {got:?}");
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(ev)) => {
+                let done = matches!(ev, Event::CycleComplete { .. });
+                got.push(ev);
+                if done {
+                    return got;
+                }
+            }
+            Ok(None) => panic!("事件流意外关闭"),
+            Err(_) => panic!("等一轮查询结束超时"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn 每个_slot_只查一组且轮询公平() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)));
+    let mut config = fast_config();
+    config.one_group_per_slot = true;
+    let (watcher, mut events) = Watcher::spawn(fake.clone(), config);
+    let mut my = target("R742", "MY/A");
+    my.locale = "en_MY".into();
+    let mut hk = target("R428", "HK/A");
+    hk.locale = "zh_HK".into();
+    watcher.set_targets(vec![my, hk]).await;
+    watcher.start().await;
+    for _ in 0..4 {
+        wait_cycle(&mut events).await;
+    }
+    watcher.stop().await;
+    assert_eq!(fake.call_count(), 4, "四个 Slot 只能启动四个 Query Group");
+    assert_eq!(
+        *fake.seen_parts.lock().await,
+        vec![
+            vec!["MY/A".to_string()],
+            vec!["HK/A".to_string()],
+            vec!["MY/A".to_string()],
+            vec!["HK/A".to_string()]
+        ]
+    );
+}
+
+fn count_in_stock(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::InStock { .. }))
+        .count()
+}
+
+#[tokio::test]
+async fn 搭档表带随请求一起发但不占状态行() {
+    // Apple Watch 的表壳单独查不出真话，必须和同页一条表带一起发；但那条表带
+    // 不是用户盯的东西：它不能出现在状态列表里，响应里缺了它也不算故障。
+    let fake = FakeFetcher::new(|_, store, parts| {
+        // 只回答表壳，故意不回答表带，模拟接口只认得其中一个。
+        let case_only: Vec<String> = parts
+            .iter()
+            .filter(|p| *p == "MEHW4CH/B")
+            .cloned()
+            .collect();
+        Ok(ok_response(store, &case_only, Availability::InStock))
+    });
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    let mut watch = target("R359", "MEHW4CH/B");
+    watch.companion_part = Some("MJUA4FE/A".into());
+    // 同店再盯一台 iPad，验证搭档排在全部目标之后、且整店仍然只发一次请求。
+    w.set_targets(vec![watch, target("R359", "ME6E4CH/A")])
+        .await;
+    w.start().await;
+
+    let events = wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    let seen = fake.seen_parts.lock().await.clone();
+    assert_eq!(seen.len(), 1, "同一门店应当只发一次请求：{seen:?}");
+    assert_eq!(
+        seen[0],
+        vec![
+            "MEHW4CH/B".to_string(),
+            "ME6E4CH/A".to_string(),
+            "MJUA4FE/A".to_string()
+        ],
+        "搭档表带必须附在同一请求里，排在目标之后"
+    );
+
+    let snap = w.snapshot().await;
+    assert_eq!(
+        snap.len(),
+        2,
+        "表带不是监控目标，不该有自己的状态行：{snap:?}"
+    );
+    let case = snap
+        .iter()
+        .find(|s| s.target.part_number == "MEHW4CH/B")
+        .expect("表壳应当有状态");
+    assert_eq!(case.availability, Availability::InStock);
+    // 表带没在响应里出现，但那不是表壳的问题；iPad 那行没被回答才是（本轮里
+    // 它会被标成「响应中没有型号」），所以健康与否只看目标本身。
+    assert_eq!(count_in_stock(&events), 1);
+}
+
+#[tokio::test]
+async fn 查询失败必须落到未知而不是无货() {
+    // 这是整个项目的核心不变量。上游在这里失守，静默失效了大半年。
+    let fake = FakeFetcher::new(|_, _, _| Err(ApiError::Blocked("HTTP 541".into())));
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    w.start().await;
+
+    let events = wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    let snap = w.snapshot().await;
+    assert_eq!(snap.len(), 1);
+    match &snap[0].availability {
+        Availability::Unknown(UnknownReason::Blocked { detail }) => {
+            assert!(detail.contains("541"));
+        }
+        other => panic!("被拦截时的状态应当是「被拦截」，实际为 {other:?}"),
+    }
+    assert_ne!(snap[0].availability, Availability::OutOfStock);
+
+    // 整轮全败，不能报告为健康，而且要发告警。
+    let healthy = events
+        .iter()
+        .any(|e| matches!(e, Event::CycleComplete { healthy: true, .. }));
+    assert!(!healthy, "整轮被拦截却报告为健康");
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Trouble { .. })),
+        "被拦截时必须发告警，否则用户不知道界面上的状态已经不可信"
+    );
+}
+
+#[tokio::test]
+async fn 有货提醒是边沿触发的() {
+    // 持续有货不该每轮都响；离开有货再回来要能再次响。
+    let fake = FakeFetcher::new(|nth, store, parts| {
+        // 第 0、1 轮有货，第 2 轮无货，第 3 轮又有货。
+        let a = match nth {
+            0 | 1 => Availability::InStock,
+            2 => Availability::OutOfStock,
+            _ => Availability::InStock,
+        };
+        Ok(ok_response(store, parts, a))
+    });
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    w.start().await;
+
+    let mut all = Vec::new();
+    for _ in 0..4 {
+        all.extend(wait_cycle(&mut rx).await);
+    }
+    w.stop().await;
+
+    // 两次「变为有货」：第一次进入，以及第 3 轮补货后再次进入。
+    assert_eq!(
+        count_in_stock(&all),
+        2,
+        "期望恰好两次到货提醒（首次有货 + 补货），实际 {} 次",
+        count_in_stock(&all)
+    );
+}
+
+#[tokio::test]
+async fn 型号不可购买时告警但不建议换网络或等更新() {
+    let fake = FakeFetcher::new(|_, _, _| {
+        Err(ApiError::Apple(
+            "Apple 没有返回任何门店；所选型号可能已停售".into(),
+        ))
+    });
+    let (w, mut rx) = Watcher::spawn(fake, fast_config());
+    w.set_targets(vec![target("R532", "MG064CH/A")]).await;
+    w.start().await;
+    let events = wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    let snap = w.snapshot().await;
+    assert!(matches!(
+        &snap[0].availability,
+        Availability::Unknown(UnknownReason::AppleError { message })
+            if message.contains("已停售")
+    ));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Trouble {
+            reason,
+            advice: None,
+        } if reason.contains("型号可能已停售")
+    )));
+}
+
+#[tokio::test]
+async fn 命中后仍继续查询所有目标但持续有货只提醒一次() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::InStock)));
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    w.start().await;
+
+    let mut alerts = 0;
+    for _ in 0..3 {
+        alerts += count_in_stock(&wait_cycle(&mut rx).await);
+    }
+    w.stop().await;
+
+    assert_eq!(alerts, 1);
+    assert!(fake.call_count() >= 3, "命中项仍须每轮查询");
+    assert!(
+        fake.seen_parts
+            .lock()
+            .await
+            .iter()
+            .all(|parts| parts == &["MG724CH/A"])
+    );
+}
+
+#[tokio::test]
+async fn 暂停后重新开始会重新布防并等待新查询确认有货() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::InStock)));
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    w.start().await;
+    assert_eq!(count_in_stock(&wait_cycle(&mut rx).await), 1);
+    w.stop().await;
+    let previous = w.snapshot().await;
+    let calls = fake.call_count();
+
+    w.start().await;
+    assert_eq!(w.snapshot().await, previous, "重新布防应保留上次结果供展示");
+    let resumed = wait_cycle(&mut rx).await;
+    assert!(fake.call_count() > calls, "必须重新查到有货才能再次提醒");
+    assert_eq!(count_in_stock(&resumed), 1, "用户重新开始后应再次提醒");
+    assert_eq!(count_in_stock(&wait_cycle(&mut rx).await), 0);
+    w.stop().await;
+}
+
+#[tokio::test]
+async fn 运行中重复开始不会重新布防() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::InStock)));
+    let (w, mut rx) = Watcher::spawn(fake, fast_config());
+    w.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    w.start().await;
+    assert_eq!(count_in_stock(&wait_cycle(&mut rx).await), 1);
+
+    w.start().await;
+    assert_eq!(count_in_stock(&wait_cycle(&mut rx).await), 0);
+    w.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn 查询快照和运行状态不会提前下一轮() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)));
+    let config = WatcherConfig {
+        interval: Duration::from_secs(60),
+        ..fast_config()
+    };
+    let (w, mut rx) = Watcher::spawn(fake.clone(), config);
+    w.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    w.start().await;
+    wait_cycle(&mut rx).await;
+
+    assert_eq!(w.snapshot().await.len(), 1);
+    assert!(w.is_running().await);
+    w.start().await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), wait_cycle(&mut rx))
+            .await
+            .is_err(),
+        "只读命令和重复开始不能绕过60秒查询间隔"
+    );
+    assert_eq!(fake.call_count(), 1);
+
+    tokio::time::advance(Duration::from_secs(59)).await;
+    wait_cycle(&mut rx).await;
+    assert_eq!(fake.call_count(), 2, "命令处理后应继续原来的等待截止时间");
+    w.stop().await;
+}
+
+#[tokio::test]
+async fn 事件积压时仍能启停且最新运行态可靠投递() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::InStock)));
+    let config = WatcherConfig {
+        event_buffer: 1,
+        ..fast_config()
+    };
+    let (w, mut rx) = Watcher::spawn(fake, config);
+    w.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    w.start().await;
+    // 容量为1的通道留着首个开始事件，查询完成后的到货事件会受到背压。
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::time::timeout(Duration::from_millis(200), w.stop())
+        .await
+        .expect("事件积压不能卡住暂停");
+    tokio::time::timeout(Duration::from_millis(200), w.start())
+        .await
+        .expect("事件积压不能卡住重新开始");
+    tokio::time::timeout(Duration::from_millis(200), w.stop())
+        .await
+        .expect("第二次暂停也须返回");
+    assert!(
+        !tokio::time::timeout(Duration::from_millis(200), w.is_running())
+            .await
+            .unwrap()
+    );
+
+    let mut running_states = Vec::new();
+    while running_states.len() < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Event::RunStateChanged { running } = event {
+            running_states.push(running);
+        }
+    }
+    assert_eq!(
+        running_states,
+        [true, false],
+        "积压的启停事件合并为最新状态"
+    );
+}
+
+#[tokio::test]
+async fn 事件积压时删除目标不会再提醒或由旧快照恢复() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::InStock)));
+    let config = WatcherConfig {
+        event_buffer: 1,
+        ..fast_config()
+    };
+    let (w, mut rx) = Watcher::spawn(fake, config);
+    w.set_targets(vec![target("R683", "REMOVE/A"), target("R683", "KEEP/A")])
+        .await;
+    w.start().await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let mut kept = target("R683", "KEEP/A");
+    kept.product_name = "更新后的商品名".into();
+    w.set_targets(vec![kept.clone()]).await;
+    assert_eq!(w.snapshot().await.len(), 1);
+
+    let events = wait_cycle(&mut rx).await;
+    assert_eq!(count_in_stock(&events), 1);
+    for event in events {
+        match event {
+            Event::InStock { state } => assert_eq!(state.target, kept),
+            Event::CycleComplete { snapshot, .. } => {
+                assert_eq!(snapshot.len(), 1);
+                assert_eq!(snapshot[0].target, kept);
+            }
+            _ => {}
+        }
+    }
+    w.stop().await;
+}
+
+#[tokio::test]
+async fn 同一门店的多个型号合并成一次请求() {
+    // 既是效率问题也是风控问题：每个型号单独发一次，出站请求量会翻好几倍。
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)));
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![
+        target("R683", "MG724CH/A"),
+        target("R683", "MG0A4CH/A"),
+        target("R683", "MG364CH/A"),
+    ])
+    .await;
+    w.start().await;
+    wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    let seen = fake.seen_parts.lock().await;
+    assert!(!seen.is_empty(), "一次请求都没发出");
+    assert_eq!(
+        seen[0].len(),
+        3,
+        "三个型号应当合并成一次请求，实际 {:?}",
+        seen[0]
+    );
+    assert_eq!(w.snapshot().await.len(), 3);
+}
+
+#[tokio::test]
+async fn 停止之后不再发起查询() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)));
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    w.start().await;
+    wait_cycle(&mut rx).await;
+
+    w.stop().await;
+    let after_stop = fake.call_count();
+    assert!(!w.is_running().await);
+
+    // stop() 返回时本轮必然已经收尾，此后不该再有任何查询。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fake.call_count(),
+        after_stop,
+        "停止之后又发起了查询，说明还有循环在跑"
+    );
+}
+
+#[tokio::test]
+async fn 并发启停不会跑出两套循环() {
+    // Go 版正是在这里翻车：Stop 释放锁去等旧循环退出，中间闯进来的 Start
+    // 会再拉起一条，两条循环同时查询、交替写同一份状态。
+    // actor 模型下命令是串行处理的，这种情况从结构上就不可能发生。
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)));
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![target("R683", "MG724CH/A")]).await;
+
+    for _ in 0..20 {
+        w.start().await;
+        wait_cycle(&mut rx).await;
+        let (a, b) = (w.clone(), w.clone());
+        let (s, t) = tokio::join!(
+            tokio::spawn(async move { a.stop().await }),
+            tokio::spawn(async move { b.start().await })
+        );
+        s.unwrap();
+        t.unwrap();
+        w.stop().await;
+        while rx.try_recv().is_ok() {}
+    }
+
+    assert_eq!(
+        fake.peak_in_flight(),
+        1,
+        "同时出现了 {} 个在飞的查询，单门店单循环最多只该有 1 个",
+        fake.peak_in_flight()
+    );
+}
+
+#[tokio::test]
+async fn 全部型号都缺失时判定为门店级失败() {
+    // 请求成功但一个型号都对不上，说明这轮实质是废的。若还算成功，就不退避、
+    // 不告警，程序会继续按原频率请求一个已经失效的结构。
+    let fake = FakeFetcher::new(|_, store, _| {
+        // 返回一个完全不相干的型号。
+        Ok(ok_response(
+            store,
+            &["OTHER/A".to_string()],
+            Availability::InStock,
+        ))
+    });
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    w.start().await;
+    let events = wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    let snap = w.snapshot().await;
+    assert!(
+        snap[0].availability.is_unknown(),
+        "型号在响应里找不到时必须是未知，实际为 {:?}",
+        snap[0].availability
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Trouble { .. })),
+        "整店型号全对不上必须告警"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::CycleComplete { healthy: true, .. })),
+        "整店型号全对不上却报告为健康"
+    );
+}
+
+#[tokio::test]
+async fn 个别型号缺失不会拖垮整个门店() {
+    // 与上一条相反的边界：只有一个型号对不上时，不该把整个门店判成故障。
+    let fake = FakeFetcher::new(|_, store, parts| {
+        // 只回第一个型号。
+        Ok(ok_response(store, &parts[..1], Availability::OutOfStock))
+    });
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![
+        target("R683", "MG724CH/A"),
+        target("R683", "MG0A4CH/A"),
+    ])
+    .await;
+    w.start().await;
+    let events = wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Trouble { .. })),
+        "只有一个型号对不上就发告警，对单个零件号的问题反应过度"
+    );
+    let snap = w.snapshot().await;
+    let unknown = snap.iter().filter(|s| s.availability.is_unknown()).count();
+    assert_eq!(unknown, 1, "应当恰好一个型号处于未知");
+}
+
+#[tokio::test]
+async fn 地区认不出来时登记为故障而不是静默跳过() {
+    // 静默跳过会让这些行永远停在「待查询」，用户看不出程序从没查过它们。
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::InStock)));
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    let mut bad = target("R683", "MG724CH/A");
+    bad.locale = "de_DE".into();
+    w.set_targets(vec![bad]).await;
+    w.start().await;
+    let events = wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    assert_eq!(fake.call_count(), 0, "地区都认不出来，不该发出任何请求");
+    let snap = w.snapshot().await;
+    match &snap[0].availability {
+        Availability::Unknown(UnknownReason::SchemaDrift { raw, .. }) => {
+            assert!(raw.contains("de_DE"));
+        }
+        other => panic!("无效地区应当登记成故障，实际为 {other:?}"),
+    }
+    assert!(events.iter().any(|e| matches!(e, Event::Trouble { .. })));
+}
+
+#[tokio::test]
+async fn 替换目标列表会保留仍存在目标的状态() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::InStock)));
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![
+        target("R683", "MG724CH/A"),
+        target("R683", "MG0A4CH/A"),
+    ])
+    .await;
+    w.start().await;
+    wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    // 去掉一个、加一个新的。
+    w.set_targets(vec![
+        target("R683", "MG724CH/A"),
+        target("R390", "MG364CH/A"),
+    ])
+    .await;
+
+    let snap = w.snapshot().await;
+    assert_eq!(snap.len(), 2);
+    let kept = snap
+        .iter()
+        .find(|s| s.target.part_number == "MG724CH/A")
+        .expect("保留下来的目标应当还在");
+    assert!(
+        kept.availability.is_in_stock(),
+        "保留下来的目标丢了既有状态"
+    );
+
+    let fresh = snap
+        .iter()
+        .find(|s| s.target.part_number == "MG364CH/A")
+        .expect("新加的目标应当在");
+    assert_eq!(
+        fresh.availability,
+        Availability::Unknown(UnknownReason::NotYetChecked),
+        "新加的目标应当是「待查询」"
+    );
+}
+
+#[tokio::test]
+async fn 事件通道再小也不会丢掉到货提醒() {
+    // 到货提醒是这个程序存在的全部理由，绝不能因为消费方慢就被丢掉。
+    // 这里把通道压到极小，并且在一轮结束前完全不消费。
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::InStock)));
+    let config = WatcherConfig {
+        event_buffer: 1,
+        ..fast_config()
+    };
+    let (w, mut rx) = Watcher::spawn(fake.clone(), config);
+
+    let targets: Vec<Target> = (0..12)
+        .map(|i| target("R683", &format!("PART{i}/A")))
+        .collect();
+    w.set_targets(targets).await;
+    w.start().await;
+
+    // 慢慢地把事件读出来，模拟一个跟不上的界面。
+    let mut in_stock = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while in_stock < 12 && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(Event::InStock { .. })) => in_stock += 1,
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    w.stop().await;
+
+    assert_eq!(
+        in_stock, 12,
+        "12 个目标同时有货，只收到 {in_stock} 条提醒 —— 有提醒被丢掉了"
+    );
+}
+
+/// 快照事件不能被丢弃，哪怕通道很小、每轮都有大量状态翻转。
+///
+/// 界面的列表**只**认 CycleComplete 带来的快照（StateChanged 是可丢的，前端刻意
+/// 不拿它做增量）。这条事件一旦丢失，界面就会停在上一轮的取值上 —— 而那很可能
+/// 正是「无货」。这正是本项目立项要消灭的失效形态。
+///
+/// 触发是确定性的而非概率性的：apply() 里那段发事件的循环一个 await 点都没有，
+/// 一轮的事件在同一次 poll 里连着灌进通道，消费方根本没机会被调度；目标数超过通道
+/// 容量时，排在最后的 CycleComplete 必然被丢。
+///
+/// 注意这里让 fetcher **每轮在成功与失败之间翻转**：否则第一轮之后状态不再变化，
+/// 就不再有 StateChanged 突发，后续轮次的 CycleComplete 会畅通无阻，测试也就
+/// 钉不住任何东西 —— 第一版正是这么写的，把修复还原后它照样通过。
+#[tokio::test]
+async fn 快照事件在每轮翻转且通道极小时也不会丢() {
+    let round = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&round);
+    let fake = FakeFetcher::new(move |nth, store, parts| {
+        // 只盯一个门店，所以「第几次调用」就是「第几轮」。相邻两轮结果必须不同，
+        // 否则第一轮之后状态不再翻转，就制造不出事件突发。
+        seen.store(nth, Ordering::SeqCst);
+        if nth % 2 == 0 {
+            Ok(ok_response(store, parts, Availability::OutOfStock))
+        } else {
+            Err(ApiError::Blocked("HTTP 541".into()))
+        }
+    });
+    let config = WatcherConfig {
+        event_buffer: 4,
+        ..fast_config()
+    };
+    let (w, mut rx) = Watcher::spawn(fake.clone(), config);
+
+    // 目标数远超通道容量，制造单轮内的事件突发。
+    let targets: Vec<Target> = (0..40)
+        .map(|i| target("R683", &format!("PART{i}/A")))
+        .collect();
+    w.set_targets(targets).await;
+    w.start().await;
+
+    // 连续等若干轮，每一轮都必须收到快照。
+    let mut cycles = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while cycles < 4 && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+            Ok(Some(Event::CycleComplete { snapshot, .. })) => {
+                assert_eq!(snapshot.len(), 40, "快照条数不对");
+                cycles += 1;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    w.stop().await;
+
+    assert_eq!(
+        cycles, 4,
+        "通道容量 4、目标 40 个且每轮翻转，只收到 {cycles} 轮快照 —— 丢掉的那些轮里，界面会一直停在旧状态"
+    );
+}
+
+/// 查询任务异常结束时，受影响的目标必须落回未知，不能停在上一轮的取值上。
+///
+/// 引擎兜住了子任务的 panic（发 Trouble、本轮不算健康），但如果那些目标的状态没被
+/// 更新，它们会保持上一轮的值 —— 包括「无货」。一次故障因此被伪装成一个看起来正常
+/// 的答案，而这正是上游静默失效大半年的形态。
+#[tokio::test]
+async fn 查询任务异常后目标不会停在陈旧的无货上() {
+    let boom = Arc::new(AtomicUsize::new(0));
+    let flag = Arc::clone(&boom);
+    let fake = FakeFetcher::new(move |_, store, parts| {
+        if flag.load(Ordering::SeqCst) > 0 {
+            panic!("模拟查询任务内部错误");
+        }
+        Ok(ok_response(store, parts, Availability::OutOfStock))
+    });
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    w.start().await;
+
+    // 第一轮正常，拿到真实的「无货」。
+    wait_one_cycle(&mut rx).await;
+    assert_eq!(
+        w.snapshot().await[0].availability,
+        Availability::OutOfStock,
+        "前置条件不成立"
+    );
+
+    // 之后每轮都 panic。
+    boom.store(1, Ordering::SeqCst);
+    wait_one_cycle(&mut rx).await;
+    w.stop().await;
+
+    let state = &w.snapshot().await[0];
+    assert_ne!(
+        state.availability,
+        Availability::OutOfStock,
+        "查询任务异常后仍停在陈旧的「无货」，这是本项目要根除的失效形态"
+    );
+    assert!(
+        state.availability.is_unknown(),
+        "应当落回未知，实际为 {:?}",
+        state.availability
+    );
+}
+
+/// 等一轮 CycleComplete。
+async fn wait_one_cycle(rx: &mut Receiver<Event>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(Event::CycleComplete { .. })) => return,
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    panic!("等一轮查询结束超时");
+}
+
+fn located(store: &str, part: &str, location: &str) -> Target {
+    Target {
+        locale: "zh_HK".into(),
+        store_number: store.into(),
+        store_title: format!("香港-{store}"),
+        part_number: part.into(),
+        product_name: format!("型号 {part}"),
+        companion_part: None,
+        pickup_location: Some(location.into()),
+    }
+}
+
+fn cycle_complete(events: &[Event]) -> (u64, bool, Vec<Event>) {
+    let Some(Event::CycleComplete {
+        next_check_in_secs,
+        paced,
+        ..
+    }) = events
+        .iter()
+        .find(|e| matches!(e, Event::CycleComplete { .. }))
+    else {
+        panic!("没有 CycleComplete：{events:?}");
+    };
+    (*next_check_in_secs, *paced, Vec::new())
+}
+
+#[tokio::test]
+async fn 同一地点的门店合并成一次按地点的请求() {
+    // 报告者盯 6 家港店：v0.4.2-beta 每轮 6 次请求，第 6 轮被拦。合并后每轮 1 次。
+    let fake = FakeFetcher::new(|_, store, _| panic!("有地点的门店不该再按门店单独查：{store}"))
+        .with_nearby(|_, location, parts| {
+            assert_eq!(location, "香港");
+            Ok(["R409", "R428", "R499"]
+                .iter()
+                .map(|s| {
+                    ok_response(
+                        s,
+                        parts,
+                        if *s == "R499" {
+                            Availability::InStock
+                        } else {
+                            Availability::OutOfStock
+                        },
+                    )
+                })
+                .collect())
+        });
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![
+        located("R409", "MJXW4ZA/A", "香港"),
+        located("R428", "MJXW4ZA/A", "香港"),
+        located("R499", "MJRX4ZA/A", "香港"),
+        located("R499", "MJXW4ZA/A", "香港"),
+    ])
+    .await;
+    w.start().await;
+    let events = wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    assert_eq!(fake.call_count(), 1, "三家店四个目标只能发一次请求");
+    let seen = fake.seen_nearby.lock().await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, "香港");
+    assert_eq!(
+        seen[0].1,
+        ["MJXW4ZA/A", "MJRX4ZA/A"],
+        "零件号取并集、去重、保持先后"
+    );
+    drop(seen);
+
+    assert_eq!(
+        count_in_stock(&events),
+        2,
+        "R499 的两个型号都有货，其余门店无货"
+    );
+    let snapshot = events
+        .iter()
+        .find_map(|e| match e {
+            Event::CycleComplete { snapshot, .. } => Some(snapshot.clone()),
+            _ => None,
+        })
+        .expect("应当有快照");
+    assert_eq!(snapshot.len(), 4);
+    assert!(
+        snapshot.iter().all(|s| !s.availability.is_unknown()),
+        "每个目标都该从合并响应里拿到自己门店的状态：{snapshot:?}"
+    );
+}
+
+#[tokio::test]
+async fn 地点响应里没有的门店单独补查并从此按门店查() {
+    // Apple 按距离只回若干家；漏掉的店这一轮补查一次，之后不再每轮先问一遍地点。
+    let fake = FakeFetcher::new(|_, store, parts| {
+        assert_eq!(store, "R610", "只有漏掉的那家才按门店查");
+        Ok(ok_response(store, parts, Availability::OutOfStock))
+    })
+    .with_nearby(|_, _, parts| Ok(vec![ok_response("R409", parts, Availability::OutOfStock)]));
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![
+        located("R409", "MJXW4ZA/A", "香港"),
+        located("R610", "MJRX4ZA/A", "香港"),
+    ])
+    .await;
+    w.start().await;
+    let first = wait_cycle(&mut rx).await;
+    let second = wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    for events in [&first, &second] {
+        let snapshot = events
+            .iter()
+            .find_map(|e| match e {
+                Event::CycleComplete { snapshot, .. } => Some(snapshot.clone()),
+                _ => None,
+            })
+            .expect("应当有快照");
+        assert!(
+            snapshot.iter().all(|s| !s.availability.is_unknown()),
+            "补查之后两家店都该有明确状态：{snapshot:?}"
+        );
+    }
+
+    let nearby = fake.seen_nearby.lock().await;
+    assert_eq!(nearby.len(), 2, "两轮各一次按地点的请求");
+    assert_eq!(
+        nearby[0].1,
+        ["MJXW4ZA/A", "MJRX4ZA/A"],
+        "第一轮还不知道 R610 不在响应里，两家的零件号都带上"
+    );
+    assert_eq!(
+        nearby[1].1,
+        ["MJXW4ZA/A"],
+        "第二轮记住了 R610 不在地点响应里，只带 R409 的零件号"
+    );
+    let stores = fake.seen_parts.lock().await;
+    assert_eq!(stores.len(), 2, "R610 每轮按门店查一次");
+    assert_eq!(fake.call_count(), 4);
+}
+
+#[tokio::test]
+async fn 没有地点的目标仍按门店查() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)));
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![
+        target("R359", "MG724CH/A"),
+        target("R683", "MG724CH/A"),
+    ])
+    .await;
+    w.start().await;
+    wait_cycle(&mut rx).await;
+    w.stop().await;
+    assert_eq!(fake.call_count(), 2);
+    assert!(fake.seen_nearby.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn 合并请求被拦时每家店都未知但只告警一次() {
+    let fake = FakeFetcher::new(|_, store, _| panic!("不该按门店查：{store}"))
+        .with_nearby(|_, _, _| Err(ApiError::Blocked("HTTP 541".into())));
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![
+        located("R409", "MJXW4ZA/A", "香港"),
+        located("R428", "MJXW4ZA/A", "香港"),
+        located("R499", "MJXW4ZA/A", "香港"),
+    ])
+    .await;
+    w.start().await;
+    let events = wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    let troubles: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(e, Event::Trouble { .. }))
+        .collect();
+    assert_eq!(troubles.len(), 1, "一次请求失败只报一条告警：{troubles:?}");
+    if let Event::Trouble { reason, .. } = troubles[0] {
+        assert!(
+            reason.contains("香港") && reason.contains("3 家") && reason.contains("R409"),
+            "告警要说清是哪次合并请求、涉及哪些门店：{reason}"
+        );
+    }
+    let snapshot = events
+        .iter()
+        .find_map(|e| match e {
+            Event::CycleComplete { snapshot, .. } => Some(snapshot.clone()),
+            _ => None,
+        })
+        .expect("应当有快照");
+    assert!(
+        snapshot.iter().all(|s| matches!(
+            &s.availability,
+            Availability::Unknown(UnknownReason::Blocked { .. })
+        )),
+        "整批都得标成被拦的未知：{snapshot:?}"
+    );
+    assert_eq!(fake.call_count(), 1, "被拦后不能再逐家去撞");
+}
+
+#[tokio::test]
+async fn 地点不被接受时退回逐家查询() {
+    // 拼错的 location 是我们的问题，不该让这些店每轮卡在同一个错误上。
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)))
+            .with_nearby(|_, _, _| {
+                Err(ApiError::Apple(
+                    "有効な市区町村または郵便番号を入力してください。".into(),
+                ))
+            });
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![
+        located("R119", "MJR84J/A", "Shibuya-ku"),
+        located("R224", "MJR84J/A", "Shibuya-ku"),
+    ])
+    .await;
+    w.start().await;
+    let first = wait_cycle(&mut rx).await;
+    let second = wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    let snapshot = first
+        .iter()
+        .find_map(|e| match e {
+            Event::CycleComplete { snapshot, .. } => Some(snapshot.clone()),
+            _ => None,
+        })
+        .expect("应当有快照");
+    assert!(
+        snapshot.iter().all(|s| !s.availability.is_unknown()),
+        "退回逐家查询后当轮就该拿到状态：{snapshot:?}"
+    );
+    assert_eq!(
+        fake.seen_nearby.lock().await.len(),
+        1,
+        "第二轮不再尝试那个地点"
+    );
+    assert_eq!(fake.seen_parts.lock().await.len(), 4, "两轮各两家按门店查");
+    let _ = second;
+}
+
+#[tokio::test]
+async fn 请求预算会把等待拉长并在事件里说明() {
+    let mut fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)));
+    fake.pacing = Duration::from_millis(400);
+    let (w, mut rx) = Watcher::spawn(fake.clone(), fast_config());
+    w.set_targets(vec![target("R359", "MG724CH/A")]).await;
+    w.start().await;
+    let started = tokio::time::Instant::now();
+    let first = wait_cycle(&mut rx).await;
+    let second = wait_cycle(&mut rx).await;
+    let elapsed = started.elapsed();
+    w.stop().await;
+
+    let (secs, paced, _) = cycle_complete(&first);
+    assert!(
+        paced,
+        "预算比 20 毫秒的间隔长，事件里必须说明是被预算拉长的"
+    );
+    assert_eq!(secs, 0, "不足一秒按整秒截断");
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "第二轮必须等预算恢复：只过了 {elapsed:?}"
+    );
+    let _ = second;
+
+    // 预算充足时不算 paced。
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)));
+    let (w, mut rx) = Watcher::spawn(fake, fast_config());
+    w.set_targets(vec![target("R359", "MG724CH/A")]).await;
+    w.start().await;
+    let events = wait_cycle(&mut rx).await;
+    w.stop().await;
+    let (_, paced, _) = cycle_complete(&events);
+    assert!(!paced);
+}
