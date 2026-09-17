@@ -172,7 +172,7 @@ pub struct Settings {
     pub sound_enabled: bool,
     /// 有货时是否自动打开购物袋页面。
     pub open_bag_on_hit: bool,
-    /// VIP 用户及各自的监控目标、Bark 提醒配置。
+    /// 用户及各自的监控目标、Bark 提醒配置。
     pub users: Vec<UserSettings>,
 }
 

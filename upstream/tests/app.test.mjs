@@ -9,7 +9,7 @@ function renderApp() {
       locale: "zh_CN", targets: [], barkUrl: "", intervalSeconds: 30,
       soundEnabled: true, openBagOnHit: true,
       users: [{
-        id: "vip-1", name: "VIP 1", barkUrl: "https://api.day.app/saved-key",
+        id: "user-1", name: "用户 1", barkUrl: "https://api.day.app/saved-key",
         alertMode: "active", targets: [],
       }],
     },

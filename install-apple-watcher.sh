@@ -73,7 +73,7 @@ unset BARK_URL TELEGRAM_TOKEN TELEGRAM_CHAT_ID
 
 cat > /etc/systemd/system/apple-watcher.service <<'UNIT'
 [Unit]
-Description=Apple Store VIP inventory watcher and local admin UI
+Description=Apple Store inventory watcher with HTTP 541 protection
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=600

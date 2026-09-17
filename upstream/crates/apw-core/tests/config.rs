@@ -92,8 +92,8 @@ fn 样例设置() -> Settings {
         sound_enabled: false,
         open_bag_on_hit: true,
         users: vec![UserSettings {
-            id: "vip-1".into(),
-            name: "马来西亚 VIP".into(),
+            id: "user-1".into(),
+            name: "马来西亚用户".into(),
             bark_url: "https://api.day.app/xxxx".into(),
             alert_mode: BarkAlertMode::Critical,
             targets,

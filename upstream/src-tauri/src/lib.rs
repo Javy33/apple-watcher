@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn 闹钟配置覆盖旧参数并保留其他_bark_设置() {
         let user = UserSettings {
-            name: "MY VIP".into(),
+            name: "MY User".into(),
             bark_url: "https://api.day.app/key?level=passive&icon=https%3A%2F%2Fx.test%2Fi.png"
                 .into(),
             alert_mode: BarkAlertMode::Critical,
@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(query.get("call").map(String::as_str), Some("1"));
         assert_eq!(query.get("sound").map(String::as_str), Some("alarm"));
         assert_eq!(query.get("volume").map(String::as_str), Some("10"));
-        assert_eq!(query.get("group").map(String::as_str), Some("Apple-MY VIP"));
+        assert_eq!(query.get("group").map(String::as_str), Some("Apple-MY User"));
         assert_eq!(
             query.get("icon").map(String::as_str),
             Some("https://x.test/i.png")

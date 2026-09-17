@@ -215,7 +215,7 @@ export default function App() {
   async function onAddUser() {
     const user: UserSettings = {
       id: crypto.randomUUID(),
-      name: `VIP ${ui.settings.users.length + 1}`,
+      name: `用户 ${ui.settings.users.length + 1}`,
       barkUrl: "",
       alertMode: "active",
       targets: [],
@@ -265,7 +265,7 @@ export default function App() {
           <div>
             <h1 className="text-xl font-semibold tracking-tight">Apple Pickup Watcher</h1>
             <p className="text-muted-foreground text-sm">
-              一个 VIP 一份监控清单，到货按各自的 Bark 方式提醒
+              一个账户一份监控清单，到货按各自的 Bark 方式提醒
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -330,7 +330,7 @@ export default function App() {
 
         <section className="grid gap-3 rounded-lg border bg-muted/30 p-4 lg:grid-cols-[12rem_1fr_1.5fr_11rem_auto] lg:items-end">
           <div className="grid gap-1.5">
-            <Label>VIP 用户</Label>
+            <Label>监控账户</Label>
             <Combobox
               options={ui.settings.users.map((user) => ({ value: user.id, label: user.name }))}
               value={activeUser?.id ?? ""}
@@ -350,7 +350,7 @@ export default function App() {
             <Input
               id="user-name"
               value={userNameValue}
-              placeholder="例如：马来西亚 VIP"
+              placeholder="例如：马来西亚账户"
               disabled={!activeUser}
               onChange={(event) => setUserNameDraft(event.target.value)}
               onBlur={() => {
@@ -635,7 +635,7 @@ export default function App() {
                       {ui.ready
                         ? activeUser
                           ? "该用户还没有监控目标。选好门店和型号后点「添加」。"
-                          : "先添加一个 VIP 用户。"
+                          : "先添加一个监控账户。"
                         : "正在载入…"}
                     </TableCell>
                   </TableRow>
@@ -671,7 +671,7 @@ export default function App() {
         </section>
 
         <footer className="text-muted-foreground text-sm">
-          VIP {ui.settings.users.length} 人 · {activeUser?.name ?? "未选用户"} 监控{" "}
+          账户 {ui.settings.users.length} 个 · {activeUser?.name ?? "未选用户"} 监控{" "}
           {displayedRows.length} 项 · 有货 {summary.inStock} · 无货 {summary.outOfStock}
           {summary.untrusted > 0 && (
             // 把「其中多少项查不到」单独点出来：这个数字大于 0 时，

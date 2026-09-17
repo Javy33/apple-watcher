@@ -229,12 +229,12 @@ def migrate_legacy():
         {"locale": "en_MY", "storeNumber": "R742", "partNumber": "MJXW4X/A"},
     ]
     profiles = {
-        "en_MY": ("vip-my", "VIP-MY", "critical"),
-        "zh_HK": ("vip-hk", "VIP-HK", "passive"),
+        "en_MY": ("monitor-my", "Malaysia", "critical"),
+        "zh_HK": ("monitor-hk", "Hong Kong", "passive"),
     }
     users = []
     for locale in dict.fromkeys(target.get("locale") for target in targets):
-        user_id, name, mode = profiles.get(locale, (f"vip-{locale}", f"VIP-{locale}", "active"))
+        user_id, name, mode = profiles.get(locale, (f"monitor-{locale}", locale, "active"))
         users.append({
             "id": user_id,
             "name": name,
@@ -375,7 +375,7 @@ def status_payload():
         checked = group["lastCheckedMs"]
         group["nextCheckAtMs"] = checked + group_count * POLL_INTERVAL_SECONDS * 1000 if checked else None
     status.update({
-        "vipCount": len(config["users"]),
+        "userCount": len(config["users"]),
         "queryGroupCount": group_count,
         "queryGroups": list(groups.values()),
     })
@@ -518,13 +518,13 @@ def watcher_loop():
             message = f"监控进程退出码 {code}；15 秒后自动重启"
             update_runtime(lastError=message)
             if process_issue != message:
-                telegram_push(f"VIP 队列存在 process-exit 错误\n{message}")
+                telegram_push(f"监控队列存在 process-exit 错误\n{message}")
                 process_issue = message
         except Exception as error:
             message = f"监控主循环错误：{error}"
             update_runtime(running=False, pid=None, lastError=message)
             if process_issue != message:
-                telegram_push(f"VIP 队列存在 watcher-loop 错误\n{message}")
+                telegram_push(f"监控队列存在 watcher-loop 错误\n{message}")
                 process_issue = message
         time.sleep(15)
 
@@ -603,8 +603,8 @@ def self_test():
         "intervalSeconds": 30,
         "users": [
             {
-                "id": "vip-my",
-                "name": "VIP-MY",
+                "id": "monitor-my",
+                "name": "Malaysia",
                 "barkUrl": "https://api.day.app/key?icon=https%3A%2F%2Fx.test%2Fa.png",
                 "alertMode": "critical",
                 "targets": [
@@ -616,7 +616,7 @@ def self_test():
     })
     assert example["intervalSeconds"] == 30
     assert len(all_targets(example)) == 1
-    url = make_bark_url(example["users"][0]["barkUrl"], "有货 / test", "银色", "critical", "VIP-MY")
+    url = make_bark_url(example["users"][0]["barkUrl"], "有货 / test", "银色", "critical", "Malaysia")
     assert "%2F" in url and "level=critical" in url and "call=1" in url and "sound=minuet" in url and "icon=" in url
     signature, body = issue_summary(
         example["users"][0],
@@ -625,7 +625,7 @@ def self_test():
             "availability": {"kind": "unknown", "reason": "blocked", "detail": "HTTP 541"},
         }],
     )
-    assert signature == (("blocked", "HTTP 541"),) and "VIP-MY 队列" in body
+    assert signature == (("blocked", "HTTP 541"),) and "Malaysia 队列" in body
     too_many = json.loads(json.dumps(example))
     too_many["users"][0]["targets"].extend([
         {"locale": "en_MY", "storeNumber": "R742", "partNumber": "THIRD/A"},
@@ -633,7 +633,7 @@ def self_test():
     ])
     try:
         validate_config(too_many)
-        raise AssertionError("VIP 机型上限未生效")
+        raise AssertionError("账户机型上限未生效")
     except ValueError as error:
         assert "最多只能监控 2 个机型" in str(error)
     original_data_dir = globals()["DATA_DIR"]
@@ -665,8 +665,8 @@ def main():
     if sys.argv[1:] == ["--test"]:
         config = load_config()
         user = next((item for item in config["users"] if item["barkUrl"]), None)
-        bark_ok = bool(user) and bark_push(user, "VIP 库存监控已配置", "管理页与热更新已启用")
-        telegram_ok = telegram_push("VIP 队列 Telegram 错误提醒已配置")
+        bark_ok = bool(user) and bark_push(user, "库存监控已配置", "管理页与热更新已启用")
+        telegram_ok = telegram_push("监控队列 Telegram 错误提醒已配置")
         return 0 if bark_ok and telegram_ok else 1
     if sys.argv[1:] == ["--migrate-legacy"]:
         migrate_legacy()
